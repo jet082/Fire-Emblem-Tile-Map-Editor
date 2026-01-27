@@ -5,14 +5,42 @@ import json
 import random
 import hashlib
 import struct
+import re
 from PIL import Image
 import argparse
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 # --- Constants ---
 TILE_SIZE = 16
 TILE_REFERENCES_PATH = "tiles/tileReferences.json"
 TILE_IMAGES_BASE_PATH = "tiles/images"
 MAP_JSON_BASE_PATH = "References/Fire Emblem Map JSON Files"
+
+TILE_CODE_MAP = {
+    'PLAIN': 'P', 'PLAIN-FLAT': 'P', 'PLAIN-PLAIN': 'P', 'PLAIN-ROAD': 'p', 'PLAIN-SAND': 'P',
+    'MOUNTAIN': 'M', 'MOUNTAIN-PEAK': 'M', 'PEAK': 'K', 'PEAK-PLAIN': 'M',
+    'FOREST': 'F', 'WOODS': 'F', 'THICKET': 'F',
+    'LAKE': 'L', 'LAKE-CLIFF': 'L', 'RIVER': 'R', 'SEA': 'S', 'WATER': 'W', 'DEEPS': 'S',
+    'DESERT': 'D', 'SAND': 'D',
+    'CLIFF': 'X', 'CLIFF-GLACIER': 'X', 'CLIFF-VALLEY': 'X', 'VALLEY': 'v',
+    'WALL': '#', 'WALL-BRACE': '#', 'WALL-DOOR': '#', 'WALL-FENCE': '#', 'WALL-FLOOR': '#', 'WALL-PILLAR': '#', 'WALL-ROOF': '#', 'WALL2': '#', 'BRACE-WALL': '#', 'DASHDASH-WALL': '#',
+    'FLOOR': '.', 'FLOOR-FLAT': '.', 'FLOOR-STAIRS': '.', 'FLOOR-WALL': '.', 'ROAD-FLOOR': '.',
+    'GATE': 'G', 'THRONE': 'T', 'CHEST': '?', 'DOOR': 'd', 'STAIRS': 'A',
+    'HOUSE': 'H', 'VILLAGE': 'V', 'VILLAGE-HOUSE': 'V', 'VILLAGE-RUINS': 'V', 'RUINS': 'U',
+    'FORT': 'f', 'ARENA': '@', 'ARMORY': 'm', 'VENDOR': 'n', 'SHOP-ARMORY': 'm', 'SHOP-VENDOR': 'n', 'INN': 'i',
+    'BRIDGE': 'B', 'ROAD': 'r', 'SNAG': 's',
+    'DECK': 'E', 'GUNNEL': 'e', 'GUNNELS': 'e', 'MAST': '|',
+    'SKY': '^', 'DASHDASH-SKY': '^',
+    'BONE': 'b', 'DASHDASH-BONE': 'b',
+    'GLACIER': 'z', 'DASHDASH-GLACIER': 'z',
+    'FLAT': '_',
+    'DASHDASH': ' ', 'EMPTY': ' '
+}
+
+CODE_TO_GROUP = {v: k for k, v in TILE_CODE_MAP.items() if k in ['PLAIN', 'MOUNTAIN', 'FOREST', 'LAKE', 'RIVER', 'WALL', 'FLOOR', 'THRONE', 'GATE', 'VILLAGE', 'ROAD', 'SEA', 'DESERT']}
 
 GAME_CONFIGS = {
     "BE8E": {
@@ -100,6 +128,61 @@ class LZ77:
             out.extend(block)
         return out
 
+# --- AI Engine ---
+class GeminiEngine:
+    def __init__(self, api_key=None, use_mock=False):
+        self.use_mock = use_mock
+        if not use_mock and api_key and genai:
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
+        else:
+            self.model = None
+
+    def generate_mission_pack(self, chapter_num):
+        if self.use_mock or not self.model:
+            return self._mock_mission_pack(chapter_num)
+
+        prompt = f"""
+        Generate a Fire Emblem mission design for Chapter {chapter_num}.
+        Return a JSON object with:
+        - "title": Mission title.
+        - "plot": 2-3 sentence plot summary.
+        - "dialogue": 5 lines of dialogue script.
+        - "main_char": {{"name": str, "class": str, "bio": str}}
+        - "macro_grid": A 10x8 grid of single characters representing terrain:
+          P=Plain, M=Mountain, F=Forest, L=Lake, R=River, #=Wall, .=Floor, G=Gate, T=Throne, V=Village, r=Road.
+          Make the grid sensible (e.g. Throne inside Walls, Roads connecting Villages).
+        """
+        try:
+            response = self.model.generate_content(prompt)
+            # Basic JSON extraction
+            text = response.text
+            match = re.search(r'{{.*}}', text, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+        except Exception as e:
+            print(f"AI Generation failed: {e}")
+
+        return self._mock_mission_pack(chapter_num)
+
+    def _mock_mission_pack(self, chapter_num):
+        return {
+            "title": f"The Road to {chapter_num}",
+            "plot": f"The heroes must cross the border to reach chapter {chapter_num}.",
+            "dialogue": "Let's move out!\nEnemy sighted!\nWe must defend the village.",
+            "main_char": {"name": "Hero", "class": "Lord", "bio": "A brave soul."},
+            "macro_grid": [
+                "PPPPPPPPPP",
+                "PFFFFFPPPP",
+                "PF...FPPPP",
+                "PF.T.FPPPP",
+                "PF...FPPPP",
+                "PFFFFFPPPP",
+                "PPPPPPPPPP",
+                "rrrrrrrrrr"
+            ]
+        }
+
 # --- Map Generation ---
 class MapGenerator:
     def __init__(self, tile_refs):
@@ -112,30 +195,27 @@ class MapGenerator:
                 self.groups[g] = []
             self.groups[g].append(r['tileHash'])
 
-    def generate(self, width, height, biome="PLAIN"):
+    def generate(self, width, height, macro_grid_data=None):
         # WFC-ish algorithm
-        # Initialize grid with all possible tiles
         grid = [[set(self.hash_to_ref.keys()) for _ in range(width)] for _ in range(height)]
 
-        # Macro-terrain biasing: Decide high-level groups
-        macro_width, macro_height = (width + 3) // 4, (height + 3) // 4
-        macro_grid = [[biome for _ in range(macro_width)] for _ in range(macro_height)]
+        if macro_grid_data:
+            # macro_grid_data is a list of strings
+            mg_h = len(macro_grid_data)
+            mg_w = len(macro_grid_data[0])
 
-        # Add some variety to macro grid
-        for _ in range(int(macro_width * macro_height * 0.2)):
-            mx, my = random.randint(0, macro_width-1), random.randint(0, macro_height-1)
-            macro_grid[my][mx] = random.choice(["MOUNTAIN", "FOREST", "LAKE", "RIVER"])
+            for y in range(height):
+                for x in range(width):
+                    mg_x = min(x * mg_w // width, mg_w - 1)
+                    mg_y = min(y * mg_h // height, mg_h - 1)
+                    code = macro_grid_data[mg_y][mg_x]
+                    target_group = CODE_TO_GROUP.get(code, "PLAIN")
 
-        # Constrain tiles based on macro grid
-        for y in range(height):
-            for x in range(width):
-                target_group = macro_grid[y // 4][x // 4]
-                # Filter grid[y][x] to only include tiles from target_group if possible
-                if target_group in self.groups:
-                    group_tiles = set(self.groups[target_group])
-                    intersection = grid[y][x].intersection(group_tiles)
-                    if intersection:
-                        grid[y][x] = intersection
+                    if target_group in self.groups:
+                        group_tiles = set(self.groups[target_group])
+                        intersection = grid[y][x].intersection(group_tiles)
+                        if intersection:
+                            grid[y][x] = intersection
 
         # Collapse cells
         collapsed_map = [[None for _ in range(width)] for _ in range(height)]
@@ -187,6 +267,82 @@ class MapGenerator:
                             # In a full WFC we would add (nx, ny) to queue, but here we only propagate from collapsed cells for speed
 
         return collapsed_map
+
+# --- Character Randomization ---
+class CharacterManager:
+    def __init__(self, rom_handler):
+        self.rom = rom_handler
+        # Basic FE8 Classes (approximate)
+        self.classes = [0x01, 0x05, 0x09, 0x0D, 0x19, 0x1D, 0x21, 0x25, 0x2D, 0x3D, 0x48]
+
+    def randomize_character(self, char_id, name=None):
+        if self.rom.game_id != "BE8E": return
+
+        entry_addr = 0x8B3D30 + (char_id * 52)
+        if entry_addr + 52 > len(self.rom.data): return
+
+        # Update Name if provided
+        if name:
+            # We'll use a new text ID for the name
+            text_id = 0x100 + char_id
+            self.rom.insert_text(text_id, name)
+            struct.pack_into("<H", self.rom.data, entry_addr, text_id)
+
+        # Randomize Class
+        new_class = random.choice(self.classes)
+        self.rom.data[entry_addr + 5] = new_class
+
+        # Randomize Stats (Bases)
+        for offset in range(12, 19): # HP, Str, Skl, Spd, Def, Res, Lck
+            self.rom.data[entry_addr + offset] = random.randint(0, 10)
+
+        # Randomize Growths
+        for offset in range(28, 35):
+            self.rom.data[entry_addr + offset] = random.randint(20, 80)
+
+        print(f"Randomized character {char_id} ({name if name else 'ID '+str(char_id)})")
+
+# --- Unit Placement ---
+class UnitPlacer:
+    def __init__(self, rom_handler):
+        self.rom = rom_handler
+
+    def generate_units(self, mission_map, tile_refs):
+        units = []
+        height = len(mission_map)
+        width = len(mission_map[0])
+        hash_to_group = {r['tileHash']: r['group'] for r in tile_refs}
+
+        # 1. Place Main Character (Slot 1)
+        # Find a suitable spot (FLOOR or PLAIN near center)
+        player_x, player_y = width // 2, height // 2
+        units.append({
+            "char": 1, "class": 0x13, "level": 1, "alliance": 0,
+            "x": player_x, "y": player_y, "items": [0x01, 0, 0, 0], "ai": [0, 0, 0, 0]
+        })
+
+        # 2. Place enemies
+        # Find THRONE or GATE for Boss
+        boss_placed = False
+        for y in range(height):
+            for x in range(width):
+                group = hash_to_group.get(mission_map[y][x], "PLAIN")
+                if group in ["THRONE", "GATE"] and not boss_placed:
+                    units.append({
+                        "char": 0x40, "class": 0x05, "level": 5, "alliance": 1,
+                        "x": x, "y": y, "items": [0x14, 0, 0, 0], "ai": [3, 3, 9, 0x20]
+                    })
+                    boss_placed = True
+
+        # Add some random mooks
+        for _ in range(10):
+            rx, ry = random.randint(0, width-1), random.randint(0, height-1)
+            units.append({
+                "char": 0x80, "class": random.choice([0x01, 0x05, 0x3F]), "level": 1, "alliance": 1,
+                "x": rx, "y": ry, "items": [0x01, 0, 0, 0], "ai": [0, 0, 9, 0]
+            })
+
+        return units
 
 # --- Dialogue Generation ---
 class DialogueGenerator:
@@ -330,6 +486,36 @@ class ROMHandler:
             struct.pack_into("<I", self.data, ptr_addr, new_addr | 0x08000000)
             print(f"Inserted dialogue at {hex(new_addr)} for text ID {text_id}")
 
+    def insert_unit_data(self, units):
+        """
+        Inserts a block of unit data and returns its address.
+        """
+        raw = bytearray()
+        for u in units:
+            entry = bytearray(20)
+            entry[0] = u['char']
+            entry[1] = u['class']
+            entry[2] = 0 # Leader
+            entry[3] = (u['level'] << 3) | u['alliance']
+            entry[4] = u['x']
+            entry[5] = u['y']
+            entry[6] = u['x']
+            entry[7] = u['y']
+            for idx, item in enumerate(u['items']):
+                entry[8 + idx] = item
+            for idx, val in enumerate(u['ai']):
+                entry[12 + idx] = val
+            raw.extend(entry)
+        raw.extend(bytearray(20)) # Termination entry
+
+        new_addr = len(self.data)
+        while len(self.data) % 4 != 0:
+            self.data.append(0)
+        new_addr = len(self.data)
+        self.data.extend(raw)
+        print(f"Inserted unit data at {hex(new_addr)}")
+        return new_addr
+
     def save(self, output_path):
         with open(output_path, "wb") as f:
             f.write(self.data)
@@ -340,6 +526,7 @@ def main():
     parser.add_argument("--rom", help="Path to Fire Emblem GBA ROM")
     parser.add_argument("--output", default="randomized", help="Base name for output files")
     parser.add_argument("--missions", type=int, default=3, help="Number of missions to generate")
+    parser.add_argument("--api-key", help="Google API Key for Gemini")
     args = parser.parse_args()
 
     print("Loading tile references...")
@@ -354,20 +541,29 @@ def main():
     dial = DialogueGenerator()
 
     rom_handler = None
+    char_mgr = None
+    unit_placer = None
     if args.rom:
         try:
             rom_handler = ROMHandler(args.rom)
             rom_handler.learn_mappings()
+            char_mgr = CharacterManager(rom_handler)
+            unit_placer = UnitPlacer(rom_handler)
         except Exception as e:
             print(f"Error loading ROM: {e}")
             rom_handler = None
 
+    api_key = os.environ.get("GOOGLE_API_KEY") or args.api_key
+    ai = GeminiEngine(api_key=api_key, use_mock=(not api_key))
+
     for i in range(1, args.missions + 1):
         print(f"Generating mission {i}...")
+        pack = ai.generate_mission_pack(i)
+        print(f"Title: {pack['title']}")
 
         # 1. Generate Map
-        width, height = 20, 15 # Standard size
-        mission_map = gen.generate(width, height)
+        width, height = 30, 20 # Larger default
+        mission_map = gen.generate(width, height, macro_grid_data=pack['macro_grid'])
 
         # 2. Generate Image
         mission_img = Image.new("RGB", (width * TILE_SIZE, height * TILE_SIZE))
@@ -383,12 +579,20 @@ def main():
         mission_img.save(f"{args.output}_mission_{i}_map.png")
 
         # 3. Generate Dialogue
-        dialogue = dial.generate_dialogue()
+        dialogue = pack['dialogue']
         with open(f"{args.output}_mission_{i}_dialogue.txt", "w") as f:
+            f.write(f"TITLE: {pack['title']}\n")
+            f.write(f"PLOT: {pack['plot']}\n")
+            f.write(f"MAIN CHARACTER: {pack['main_char']['name']} ({pack['main_char']['class']})\n")
+            f.write(f"BIO: {pack['main_char']['bio']}\n")
+            f.write("------------------\n")
             f.write(dialogue)
 
         # 4. Insert into ROM if possible
         if rom_handler:
+            # Randomize main character for this mission (e.g. use Eirika's slot 0x01)
+            char_mgr.randomize_character(1, name=pack['main_char']['name'])
+
             # Use learned indices
             map_indices = []
             for y in range(height):
@@ -401,6 +605,10 @@ def main():
             rom_handler.insert_map(i, map_indices)
             # Insert dialogue (using text IDs 0x900 + i as a safe-ish range)
             rom_handler.insert_text(0x900 + i, dialogue)
+
+            # 5. Place units
+            units = unit_placer.generate_units(mission_map, tile_refs)
+            unit_addr = rom_handler.insert_unit_data(units)
 
     if rom_handler:
         rom_handler.save(f"{args.output}.gba")
