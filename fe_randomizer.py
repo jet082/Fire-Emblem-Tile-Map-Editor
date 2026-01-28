@@ -46,27 +46,42 @@ GAME_CONFIGS = {
     "BE8E": {
         "name": "Fire Emblem 8 (U)",
         "map_table": 0x8B0890,
+        "event_ptr_table": 0x8B363C,
         "entry_size": 148,
         "num_missions": 77,
-        "map_ptr_offset": 4,
+        "map_plist_offset": 8,
+        "unit_ptr_offset": 0x70,
+        "char_table": 0x8B3D30,
+        "char_entry_size": 52,
+        "main_char_id": 1,
         "text_table": 0x15D48C,
         "json_dir": "Fire Emblem 8/Chapters"
     },
     "AE7E": {
         "name": "Fire Emblem 7 (U)",
         "map_table": 0xC941D0,
+        "event_ptr_table": 0xC999C0,
         "entry_size": 84,
         "num_missions": 100,
-        "map_ptr_offset": 4,
+        "map_plist_offset": 4,
+        "unit_ptr_offset": 0x2C,
+        "char_table": 0xBDCEE0,
+        "char_entry_size": 52,
+        "main_char_id": 1,
         "text_table": 0xB808AC,
         "json_dir": "Fire Emblem 7/Chapters"
     },
     "AFEJ": {
         "name": "Fire Emblem 6 (J)",
         "map_table": 0x664410,
+        "event_ptr_table": 0x667798,
         "entry_size": 52,
         "num_missions": 50,
-        "map_ptr_offset": 0,
+        "map_plist_offset": 0, # Direct pointer to plist-like table
+        "unit_ptr_offset": 0x20,
+        "char_table": 0x6076A0,
+        "char_entry_size": 48,
+        "main_char_id": 1,
         "text_table": 0x144514,
         "json_dir": "Fire Emblem 6/Chapters"
     }
@@ -285,10 +300,11 @@ class CharacterManager:
         self.classes = [0x01, 0x05, 0x09, 0x0D, 0x19, 0x1D, 0x21, 0x25, 0x2D, 0x3D, 0x48]
 
     def randomize_character(self, char_id, name=None):
-        if self.rom.game_id != "BE8E": return
+        config = self.rom.config
+        if 'char_table' not in config: return
 
-        entry_addr = 0x8B3D30 + (char_id * 52)
-        if entry_addr + 52 > len(self.rom.data): return
+        entry_addr = config['char_table'] + (char_id * config['char_entry_size'])
+        if entry_addr + config['char_entry_size'] > len(self.rom.data): return
 
         # Update Name if provided
         if name:
@@ -310,7 +326,7 @@ class CharacterManager:
 
     def randomize_all(self):
         """Randomizes the entire character table once."""
-        if self.rom.game_id != "BE8E": return
+        if 'char_table' not in self.rom.config: return
         print("Randomizing global character pool...")
         for i in range(1, 255): # Max 255 characters
             self.randomize_character(i)
@@ -411,9 +427,30 @@ class ROMHandler:
             self.data = bytearray(f.read())
         self.game_id = self.data[0xAC:0xB0].decode('ascii', errors='ignore')
         if self.game_id not in GAME_CONFIGS:
-            raise ValueError(f"Unsupported Game ID: {self.game_id}")
+            # Try to find by pattern
+            self.game_id = self._autodetect_game()
+            if self.game_id not in GAME_CONFIGS:
+                raise ValueError(f"Unsupported Game ID: {self.game_id}")
+
         self.config = GAME_CONFIGS[self.game_id]
+        self._verify_tables()
         self.hash_to_index = {} # To be filled by learning
+
+    def _autodetect_game(self):
+        # Scan first 0x200 for IDs
+        header = self.data[:0x200]
+        if b"FIREEMBLEM8" in header or b"BE8E" in header: return "BE8E"
+        if b"FIREEMBLEM7" in header or b"AE7E" in header: return "AE7E"
+        if b"FIREEMBLEM6" in header or b"AFEJ" in header: return "AFEJ"
+        return "UNKNOWN"
+
+    def _verify_tables(self):
+        # Basic check if map_table pointer at 0 looks like a ROM pointer
+        tbl = self.config['map_table']
+        if tbl < len(self.data):
+            ptr = struct.unpack_from("<I", self.data, tbl)[0]
+            if not (0x08000000 <= ptr <= 0x09FFFFFF):
+                print(f"Warning: map_table at {hex(tbl)} doesn't look like a pointer table (Value: {hex(ptr)})")
 
     def learn_mappings(self):
         """
@@ -428,7 +465,15 @@ class ROMHandler:
         print(f"Learning mappings for {self.config['name']}...")
         # Scan some chapters to build mapping
         for map_id in range(10): # Check first 10 chapters
-            ptr_addr = self.get_map_pointer(map_id)
+            entry_addr = self.get_chapter_entry(map_id)
+            if entry_addr + self.config['entry_size'] > len(self.data):
+                continue
+
+            # Use plist logic
+            plist_idx = self.data[entry_addr + self.config['map_plist_offset']]
+            if plist_idx == 0: continue
+            ptr_addr = self.config['event_ptr_table'] + plist_idx * 4
+
             if not ptr_addr or ptr_addr >= len(self.data): continue
 
             map_ptr = struct.unpack("<I", self.data[ptr_addr:ptr_addr+4])[0] & 0xFFFFFF
@@ -461,11 +506,8 @@ class ROMHandler:
 
         print(f"Learned {len(self.hash_to_index)} tile mappings.")
 
-    def get_map_pointer(self, map_id):
-        entry_addr = self.config['map_table'] + map_id * self.config['entry_size']
-        if entry_addr + self.config['entry_size'] > len(self.data):
-            return None
-        return entry_addr + self.config['map_ptr_offset']
+    def get_chapter_entry(self, map_id):
+        return self.config['map_table'] + map_id * self.config['entry_size']
 
     def insert_map(self, map_id, map_indices):
         # Convert list of indices to bytes
@@ -482,16 +524,25 @@ class ROMHandler:
         new_addr = len(self.data)
         self.data.extend(compressed)
 
-        ptr_addr = self.get_map_pointer(map_id)
-        if ptr_addr:
-            old_ptr = struct.unpack_from("<I", self.data, ptr_addr)[0]
-            if old_ptr == 0:
-                print(f"Skipping map {map_id}: Entry is null")
+        entry_addr = self.get_chapter_entry(map_id)
+        if entry_addr + self.config['entry_size'] > len(self.data):
+            return False
+
+        if self.game_id == "AFEJ": # FE6 direct pointer logic
+            table_ptr = struct.unpack_from("<I", self.data, entry_addr)[0] & 0xFFFFFF
+            if table_ptr == 0 or table_ptr >= len(self.data): return False
+            struct.pack_into("<I", self.data, table_ptr, new_addr | 0x08000000)
+        else: # FE7/FE8 Plist logic
+            plist_idx = self.data[entry_addr + self.config['map_plist_offset']]
+            if plist_idx == 0:
+                print(f"Skipping map {map_id}: Plist index is 0")
                 return False
+            ptr_addr = self.config['event_ptr_table'] + plist_idx * 4
+            if ptr_addr + 4 > len(self.data): return False
             struct.pack_into("<I", self.data, ptr_addr, new_addr | 0x08000000)
-            print(f"Inserted map {map_id} at {hex(new_addr)}")
-            return True
-        return False
+
+        print(f"Inserted map {map_id} at {hex(new_addr)}")
+        return True
 
     def insert_text(self, text_id, text):
         """
@@ -520,7 +571,7 @@ class ROMHandler:
             struct.pack_into("<I", self.data, ptr_addr, new_addr | 0x08000000)
             print(f"Inserted dialogue at {hex(new_addr)} for text ID {text_id}")
 
-    def insert_unit_data(self, units):
+    def insert_unit_data(self, map_id, units):
         """
         Inserts a block of unit data and returns its address.
         """
@@ -547,7 +598,17 @@ class ROMHandler:
             self.data.append(0)
         new_addr = len(self.data)
         self.data.extend(raw)
-        print(f"Inserted unit data at {hex(new_addr)}")
+
+        # Update Chapter Table unit pointers
+        entry_addr = self.get_chapter_entry(map_id)
+        if entry_addr + self.config['entry_size'] <= len(self.data):
+            # Update multiple slots (Normal/Hard, Player/Enemy)
+            for offset in range(0, 16, 4): # Usually 4 pointers
+                ptr_addr = entry_addr + self.config['unit_ptr_offset'] + offset
+                if ptr_addr + 4 <= len(self.data):
+                    struct.pack_into("<I", self.data, ptr_addr, new_addr | 0x08000000)
+
+        print(f"Inserted unit data for mission {map_id} at {hex(new_addr)}")
         return new_addr
 
     def save(self, output_path):
@@ -632,8 +693,9 @@ def main():
 
         # 4. Insert into ROM if possible
         if rom_handler:
-            # Randomize main character for this mission (e.g. use Eirika's slot 0x01)
-            char_mgr.randomize_character(1, name=pack['main_char']['name'])
+            # Randomize main character for this mission
+            main_char_id = rom_handler.config.get('main_char_id', 1)
+            char_mgr.randomize_character(main_char_id, name=pack['main_char']['name'])
 
             # Use learned indices
             map_indices = []
@@ -649,8 +711,8 @@ def main():
             rom_handler.insert_text(0x900 + i, dialogue)
 
             # 5. Place units
-            units = unit_placer.generate_units(mission_map, tile_refs)
-            unit_addr = rom_handler.insert_unit_data(units)
+            units = unit_placer.generate_units(mission_map, tile_refs, main_char_id=main_char_id)
+            unit_addr = rom_handler.insert_unit_data(i, units)
 
     if rom_handler:
         rom_handler.save(f"{args.output}.gba")
