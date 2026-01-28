@@ -46,18 +46,27 @@ GAME_CONFIGS = {
     "BE8E": {
         "name": "Fire Emblem 8 (U)",
         "map_table": 0x8B0890,
+        "entry_size": 148,
+        "num_missions": 77,
+        "map_ptr_offset": 4,
         "text_table": 0x15D48C,
         "json_dir": "Fire Emblem 8/Chapters"
     },
     "AE7E": {
         "name": "Fire Emblem 7 (U)",
         "map_table": 0xC941D0,
+        "entry_size": 84,
+        "num_missions": 100,
+        "map_ptr_offset": 4,
         "text_table": 0xB808AC,
         "json_dir": "Fire Emblem 7/Chapters"
     },
     "AFEJ": {
         "name": "Fire Emblem 6 (J)",
         "map_table": 0x664410,
+        "entry_size": 52,
+        "num_missions": 50,
+        "map_ptr_offset": 0,
         "text_table": 0x144514,
         "json_dir": "Fire Emblem 6/Chapters"
     }
@@ -283,7 +292,6 @@ class CharacterManager:
 
         # Update Name if provided
         if name:
-            # We'll use a new text ID for the name
             text_id = 0x100 + char_id
             self.rom.insert_text(text_id, name)
             struct.pack_into("<H", self.rom.data, entry_addr, text_id)
@@ -300,26 +308,49 @@ class CharacterManager:
         for offset in range(28, 35):
             self.rom.data[entry_addr + offset] = random.randint(20, 80)
 
-        print(f"Randomized character {char_id} ({name if name else 'ID '+str(char_id)})")
+    def randomize_all(self):
+        """Randomizes the entire character table once."""
+        if self.rom.game_id != "BE8E": return
+        print("Randomizing global character pool...")
+        for i in range(1, 255): # Max 255 characters
+            self.randomize_character(i)
 
 # --- Unit Placement ---
 class UnitPlacer:
     def __init__(self, rom_handler):
         self.rom = rom_handler
 
-    def generate_units(self, mission_map, tile_refs):
+    def generate_units(self, mission_map, tile_refs, main_char_id=1):
         units = []
         height = len(mission_map)
         width = len(mission_map[0])
         hash_to_group = {r['tileHash']: r['group'] for r in tile_refs}
 
-        # 1. Place Main Character (Slot 1)
-        # Find a suitable spot (FLOOR or PLAIN near center)
-        player_x, player_y = width // 2, height // 2
-        units.append({
-            "char": 1, "class": 0x13, "level": 1, "alliance": 0,
-            "x": player_x, "y": player_y, "items": [0x01, 0, 0, 0], "ai": [0, 0, 0, 0]
-        })
+        # 1. Place Player Units
+        # Find some PLAIN or FLOOR tiles for players
+        player_spots = []
+        for y in range(height):
+            for x in range(width):
+                if hash_to_group.get(mission_map[y][x]) in ["PLAIN", "FLOOR"]:
+                    player_spots.append((x, y))
+
+        random.shuffle(player_spots)
+
+        # Main Character
+        if player_spots:
+            px, py = player_spots.pop()
+            units.append({
+                "char": main_char_id, "class": 0x01, "level": 1, "alliance": 0,
+                "x": px, "y": py, "items": [0x01, 0, 0, 0], "ai": [0, 0, 0, 0]
+            })
+
+        # A few allies
+        for i in range(min(5, len(player_spots))):
+            px, py = player_spots.pop()
+            units.append({
+                "char": 2 + i, "class": random.choice([0x05, 0x09, 0x0D]), "level": 1, "alliance": 0,
+                "x": px, "y": py, "items": [0x01, 0, 0, 0], "ai": [0, 0, 0, 0]
+            })
 
         # 2. Place enemies
         # Find THRONE or GATE for Boss
@@ -329,18 +360,21 @@ class UnitPlacer:
                 group = hash_to_group.get(mission_map[y][x], "PLAIN")
                 if group in ["THRONE", "GATE"] and not boss_placed:
                     units.append({
-                        "char": 0x40, "class": 0x05, "level": 5, "alliance": 1,
+                        "char": 0x40 + random.randint(0, 10), "class": 0x05, "level": 5, "alliance": 1,
                         "x": x, "y": y, "items": [0x14, 0, 0, 0], "ai": [3, 3, 9, 0x20]
                     })
                     boss_placed = True
 
         # Add some random mooks
-        for _ in range(10):
+        for _ in range(15):
             rx, ry = random.randint(0, width-1), random.randint(0, height-1)
-            units.append({
-                "char": 0x80, "class": random.choice([0x01, 0x05, 0x3F]), "level": 1, "alliance": 1,
-                "x": rx, "y": ry, "items": [0x01, 0, 0, 0], "ai": [0, 0, 9, 0]
-            })
+            # Ensure not on a wall or deep water
+            group = hash_to_group.get(mission_map[ry][rx], "PLAIN")
+            if group not in ["WALL", "SEA", "DEEPS", "SKY"]:
+                units.append({
+                    "char": 0x80 + random.randint(0, 50), "class": random.choice([0x01, 0x05, 0x3F]), "level": 1, "alliance": 1,
+                    "x": rx, "y": ry, "items": [0x01, 0, 0, 0], "ai": [0, 0, 9, 0]
+                })
 
         return units
 
@@ -428,16 +462,10 @@ class ROMHandler:
         print(f"Learned {len(self.hash_to_index)} tile mappings.")
 
     def get_map_pointer(self, map_id):
-        entry_addr = self.config['map_table'] + map_id * 32 # Usually 32 or 12 bytes depending on game
-        # FE8 entry is ~32 bytes. Map pointer is at offset 4?
-        # This is very game specific.
-        if self.game_id == "BE8E": # FE8
-            return entry_addr + 4
-        elif self.game_id == "AE7E": # FE7
-            return entry_addr + 4
-        elif self.game_id == "AFEJ": # FE6
-            return entry_addr + 0 # Wait, FE6 table is different
-        return None
+        entry_addr = self.config['map_table'] + map_id * self.config['entry_size']
+        if entry_addr + self.config['entry_size'] > len(self.data):
+            return None
+        return entry_addr + self.config['map_ptr_offset']
 
     def insert_map(self, map_id, map_indices):
         # Convert list of indices to bytes
@@ -456,8 +484,14 @@ class ROMHandler:
 
         ptr_addr = self.get_map_pointer(map_id)
         if ptr_addr:
+            old_ptr = struct.unpack_from("<I", self.data, ptr_addr)[0]
+            if old_ptr == 0:
+                print(f"Skipping map {map_id}: Entry is null")
+                return False
             struct.pack_into("<I", self.data, ptr_addr, new_addr | 0x08000000)
             print(f"Inserted map {map_id} at {hex(new_addr)}")
+            return True
+        return False
 
     def insert_text(self, text_id, text):
         """
@@ -525,7 +559,7 @@ def main():
     parser = argparse.ArgumentParser(description="Fire Emblem Map & Dialogue Randomizer")
     parser.add_argument("--rom", help="Path to Fire Emblem GBA ROM")
     parser.add_argument("--output", default="randomized", help="Base name for output files")
-    parser.add_argument("--missions", type=int, default=3, help="Number of missions to generate")
+    parser.add_argument("--missions", type=int, help="Number of missions to generate (default: all)")
     parser.add_argument("--api-key", help="Google API Key for Gemini")
     args = parser.parse_args()
 
@@ -548,6 +582,7 @@ def main():
             rom_handler = ROMHandler(args.rom)
             rom_handler.learn_mappings()
             char_mgr = CharacterManager(rom_handler)
+            char_mgr.randomize_all()
             unit_placer = UnitPlacer(rom_handler)
         except Exception as e:
             print(f"Error loading ROM: {e}")
@@ -556,7 +591,14 @@ def main():
     api_key = os.environ.get("GOOGLE_API_KEY") or args.api_key
     ai = GeminiEngine(api_key=api_key, use_mock=(not api_key))
 
-    for i in range(1, args.missions + 1):
+    num_missions = args.missions
+    if num_missions is None:
+        if rom_handler:
+            num_missions = rom_handler.config['num_missions']
+        else:
+            num_missions = 3 # Fallback if no ROM
+
+    for i in range(0, num_missions):
         print(f"Generating mission {i}...")
         pack = ai.generate_mission_pack(i)
         print(f"Title: {pack['title']}")
